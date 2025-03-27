@@ -1,27 +1,28 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {ITicketNFT} from "./interfaces/ITicketNFT.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {TicketNFT} from "./TicketNFT.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol"; 
-import {ITicketMarketplace} from "./interfaces/ITicketMarketplace.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import "hardhat/console.sol";
+import {TicketNFT} from "./TicketNFT.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract TicketMarketplace is ITicketMarketplace, Ownable {
+contract TicketMarketplace is Ownable {
     struct Event {
-        uint128 maxTickets;
+        uint256 nextTicketToSell;
+        uint256 maxTickets;
         uint256 pricePerTicket;
         uint256 pricePerTicketERC20;
-        uint128 ticketsSold;
-        uint128 nextTicketToSell;
     }
 
-    TicketNFT public immutable ticketNFT;
+    TicketNFT public ticketNFT;
     IERC20 public erc20Token;
-    mapping(uint128 => Event) public events;
-    uint128 public nextEventId;
+    uint256 public currentEventId;
+    mapping(uint256 => Event) public events;
+
+    event EventCreated(uint256 indexed eventId, uint256 maxTickets, uint256 pricePerTicket, uint256 pricePerTicketERC20);
+    event MaxTicketsUpdated(uint256 indexed eventId, uint256 newMaxTickets);
+    event PriceUpdated(uint256 indexed eventId, uint256 newPrice);
+    event TicketsBought(uint256 indexed eventId, address indexed buyer, uint256 ticketCount, uint256 startSeatNumber);
+    event TicketsBoughtERC20(uint256 indexed eventId, address indexed buyer, uint256 ticketCount, uint256 startSeatNumber);
 
     constructor(address _ticketNFT, address _erc20Token) Ownable(msg.sender) {
         ticketNFT = TicketNFT(_ticketNFT);
@@ -36,89 +37,85 @@ contract TicketMarketplace is ITicketMarketplace, Ownable {
         return address(erc20Token);
     }
 
-    function currentEventId() external view returns (uint128) {
-        return nextEventId;
-    }
-
-    function createEvent(uint128 maxTickets, uint256 pricePerTicket, uint256 pricePerTicketERC20) external override onlyOwner {
+    function createEvent(uint256 maxTickets, uint256 pricePerTicket, uint256 pricePerTicketERC20) external {
+        require(msg.sender == owner(), "Unauthorized access");
         require(maxTickets > 0, "Max tickets must be greater than 0");
-        require(pricePerTicket > 0, "ETH price must be greater than 0");
-        require(pricePerTicketERC20 > 0, "ERC20 price must be greater than 0");
+        require(pricePerTicket > 0, "Price per ticket must be greater than 0");
+        require(pricePerTicketERC20 > 0, "Price per ticket in ERC20 must be greater than 0");
         
-        events[nextEventId] = Event({
+        events[currentEventId] = Event({
+            nextTicketToSell: 0,
             maxTickets: maxTickets,
             pricePerTicket: pricePerTicket,
-            pricePerTicketERC20: pricePerTicketERC20,
-            ticketsSold: 0,
-            nextTicketToSell: 0
+            pricePerTicketERC20: pricePerTicketERC20
         });
 
-        emit EventCreated(nextEventId, maxTickets, pricePerTicket, pricePerTicketERC20);
-        nextEventId++;
+        emit EventCreated(currentEventId, maxTickets, pricePerTicket, pricePerTicketERC20);
+        currentEventId++;
     }
 
-    function setMaxTicketsForEvent(uint128 eventId, uint128 newMaxTickets) external override onlyOwner {
+    function setMaxTicketsForEvent(uint256 eventId, uint256 newMaxTickets) external {
+        require(msg.sender == owner(), "Unauthorized access");
+        require(events[eventId].maxTickets > 0, "Event does not exist");
         require(newMaxTickets > 0, "Max tickets must be greater than 0");
-        require(newMaxTickets >= events[eventId].ticketsSold, "The new number of max tickets is too small!");
-        
+        require(newMaxTickets >= events[eventId].nextTicketToSell, "The new number of max tickets is too small!");
+        require(newMaxTickets >= events[eventId].maxTickets, "The new number of max tickets is too small!");
+
         events[eventId].maxTickets = newMaxTickets;
-        emit MaxTicketsUpdate(eventId, newMaxTickets);
+        emit MaxTicketsUpdated(eventId, newMaxTickets);
     }
 
-    function setPriceForTicketETH(uint128 eventId, uint256 price) external override onlyOwner {
-        require(price > 0, "Price must be greater than 0");
-        
-        events[eventId].pricePerTicket = price;
-        emit PriceUpdate(eventId, price, "ETH");
+    function setPriceForTicketETH(uint256 eventId, uint256 newPrice) external {
+        require(msg.sender == owner(), "Unauthorized access");
+        require(events[eventId].maxTickets > 0, "Event does not exist");
+        require(newPrice > 0, "Price must be greater than 0");
+
+        events[eventId].pricePerTicket = newPrice;
+        emit PriceUpdated(eventId, newPrice);
     }
 
-    function setPriceForTicketERC20(uint128 eventId, uint256 price) external override onlyOwner {
-        require(price > 0, "Price must be greater than 0");
-        
-        events[eventId].pricePerTicketERC20 = price;
-        emit PriceUpdate(eventId, price, "ERC20");
+    function setPriceForTicketERC20(uint256 eventId, uint256 newPrice) external {
+        require(msg.sender == owner(), "Unauthorized access");
+        require(events[eventId].maxTickets > 0, "Event does not exist");
+        require(newPrice > 0, "Price must be greater than 0");
+
+        events[eventId].pricePerTicketERC20 = newPrice;
+        emit PriceUpdated(eventId, newPrice);
     }
 
-    function buyTickets(uint128 eventId, uint128 ticketCount) external payable override {
-        Event storage event_ = events[eventId];
-        require(event_.maxTickets > 0, "Event does not exist");
-        require(event_.ticketsSold + ticketCount <= event_.maxTickets, "We don't have that many tickets left to sell!");
-        
-        uint256 totalCost = event_.pricePerTicket * ticketCount;
-        require(totalCost <= msg.value, "Not enough funds supplied to buy the specified number of tickets.");
+    function buyTickets(uint256 eventId, uint256 ticketCount) external payable {
+        require(events[eventId].maxTickets > 0, "Event does not exist");
+        require(ticketCount > 0 && ticketCount <= events[eventId].maxTickets - events[eventId].nextTicketToSell, "Not enough tickets available");
+        require(events[eventId].nextTicketToSell + ticketCount <= events[eventId].maxTickets, "Seat number too large");
+        require(msg.value >= events[eventId].pricePerTicket * ticketCount, "Insufficient payment");
 
-        uint256 startSeatNumber = event_.ticketsSold + 1;
-        for (uint128 i = 0; i < ticketCount; i++) {
-            uint256 ticketId = (uint256(eventId) << 128) + startSeatNumber + i;
+        for (uint256 i = 0; i < ticketCount; i++) {
+            uint256 ticketId = (uint256(eventId) << 128) + (events[eventId].nextTicketToSell + i);
             ticketNFT.mintFromMarketPlace(msg.sender, ticketId);
         }
 
-        event_.ticketsSold += ticketCount;
-        emit TicketsBought(eventId, ticketCount, "ETH");
+        events[eventId].nextTicketToSell += ticketCount;
+        emit TicketsBought(eventId, msg.sender, ticketCount, events[eventId].nextTicketToSell - ticketCount);
     }
 
-    function buyTicketsERC20(uint128 eventId, uint128 ticketCount) external override {
-        Event storage event_ = events[eventId];
-        require(event_.maxTickets > 0, "Event does not exist");
-        require(event_.ticketsSold + ticketCount <= event_.maxTickets, "We don't have that many tickets left to sell!");
-        require(erc20Token != IERC20(address(0)), "ERC20 token not set");
-        
-        uint256 totalCost = event_.pricePerTicketERC20 * ticketCount;
-        require(erc20Token.transferFrom(msg.sender, address(this), totalCost), "ERC20 transfer failed");
+    function buyTicketsERC20(uint256 eventId, uint256 ticketCount) external {
+        require(events[eventId].maxTickets > 0, "Event does not exist");
+        require(ticketCount > 0 && ticketCount <= events[eventId].maxTickets - events[eventId].nextTicketToSell, "Not enough tickets available");
+        require(events[eventId].nextTicketToSell + ticketCount <= events[eventId].maxTickets, "Seat number too large");
+        require(erc20Token.transferFrom(msg.sender, address(this), events[eventId].pricePerTicketERC20 * ticketCount), "Insufficient payment");
 
-        uint256 startSeatNumber = event_.ticketsSold + 1;
-        for (uint128 i = 0; i < ticketCount; i++) {
-            uint256 ticketId = (uint256(eventId) << 128) + startSeatNumber + i;
+        for (uint256 i = 0; i < ticketCount; i++) {
+            uint256 ticketId = (uint256(eventId) << 128) + (events[eventId].nextTicketToSell + i);
             ticketNFT.mintFromMarketPlace(msg.sender, ticketId);
         }
 
-        event_.ticketsSold += ticketCount;
-        emit TicketsBought(eventId, ticketCount, "ERC20");
+        events[eventId].nextTicketToSell += ticketCount;
+        emit TicketsBoughtERC20(eventId, msg.sender, ticketCount, events[eventId].nextTicketToSell - ticketCount);
     }
 
-    function setERC20Address(address newERC20Address) external override onlyOwner {
-        require(newERC20Address != address(0), "Invalid ERC20 address");
-        erc20Token = IERC20(newERC20Address);
-        emit ERC20AddressUpdate(newERC20Address);
+    function setERC20Address(address _erc20Token) external {
+        require(msg.sender == owner(), "Unauthorized access");
+        require(_erc20Token != address(0), "Invalid ERC20 address");
+        erc20Token = IERC20(_erc20Token);
     }
 }
